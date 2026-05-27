@@ -32,9 +32,44 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      # Disable in-process scheduler — the Render cron job below handles it
       - key: DAILY_MY_PROBLEM_TELEGRAM_ENABLED
-        value: "true"
-      - key: DAILY_MY_PROBLEM_TELEGRAM_TIME
-        value: "06:00"
-      - key: DAILY_MY_PROBLEM_TELEGRAM_TIMEZONE
-        value: Asia/Kolkata
+        value: "false"
+
+  # ── Daily My Problem Telegram bite ──────────────────────────────
+  # Runs as a standalone process on schedule.
+  # Render cron uses UTC — 00:30 UTC = 06:00 IST
+  - type: cron
+    name: daily-my-problem-telegram
+    runtime: python
+    rootDir: backend
+    schedule: "30 0 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/cron_daily_bite.py
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LLM_PROVIDER
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: PROBLEMS_FILE_PATH
+        value: ./data/problems.txt
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_PARSE_MODE
+        value: HTML
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: LEETCODE_SUBMISSIONS_URL
+        sync: false
