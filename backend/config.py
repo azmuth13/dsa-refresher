@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     TELEGRAM_PARSE_MODE: str = "HTML"
+    LOG_LEVEL: str = "INFO"
 
     @property
     def cors_origins_list(self) -> list[str]:

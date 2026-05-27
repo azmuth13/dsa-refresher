@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from services.supabase_service import (
     unix_timestamp_to_iso,
     upsert_solved_problems,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -210,23 +213,39 @@ def _existing_leetcode_slugs(urls: list[str]) -> set[str]:
 
 async def _fetch_leetcode_submissions() -> list[LeetCodeSubmission]:
     settings = get_settings()
+    logger.info("Fetching LeetCode submissions", extra={"url": settings.LEETCODE_SUBMISSIONS_URL})
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             response = await client.get(settings.LEETCODE_SUBMISSIONS_URL)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
+        logger.error(
+            "LeetCode submissions API returned error",
+            extra={"status_code": exc.response.status_code, "url": settings.LEETCODE_SUBMISSIONS_URL},
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"LeetCode submissions API returned {exc.response.status_code}",
         ) from exc
     except httpx.HTTPError as exc:
+        logger.error(
+            "LeetCode submissions fetch network failure",
+            extra={"url": settings.LEETCODE_SUBMISSIONS_URL},
+            exc_info=True,
+        )
         raise HTTPException(status_code=502, detail=f"Could not fetch LeetCode submissions: {exc}") from exc
 
     payload = response.json()
     submissions = payload.get("submission", [])
     if not isinstance(submissions, list):
+        logger.error(
+            "LeetCode submissions API returned unexpected response shape",
+            extra={"payload_keys": list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__},
+        )
         raise HTTPException(status_code=502, detail="LeetCode submissions API returned an unexpected response")
 
+    logger.info("LeetCode submissions fetched", extra={"total": len(submissions)})
     return [LeetCodeSubmission.model_validate(item) for item in submissions]
 
 
@@ -383,16 +402,31 @@ def _fallback_refresher(metadata: dict, llm: LLMService, reason: str) -> Problem
 async def my_problems(count: int = Query(default=1, ge=1, le=5)):
     problem_records = await _read_problem_records()
     if not problem_records:
+        logger.warning("No solved problems found in storage")
         raise HTTPException(status_code=404, detail="No solved problems found")
 
     selected_records = random.sample(problem_records, k=min(count, len(problem_records)))
+    logger.info("Generating problem refreshers", extra={"requested": count, "selected": len(selected_records)})
     llm = LLMService()
     refreshers: list[ProblemRefresher] = []
     for record in selected_records:
-        metadata = _metadata_from_problem_record(record) or _leetcode_metadata_from_url(record["url"]) or await parse_problem_metadata(record["url"])
+        url = record.get("url", "")
+        metadata = _metadata_from_problem_record(record) or _leetcode_metadata_from_url(url) or await parse_problem_metadata(url)
+        logger.info(
+            "Generating refresher",
+            extra={"problem_title": metadata.get("title"), "platform": metadata.get("platform"), "url": url},
+        )
         try:
             refreshers.append(await _generate_refresher(metadata, llm))
-        except (json.JSONDecodeError, ValidationError):
+            logger.info(
+                "Refresher generated successfully",
+                extra={"problem_title": metadata.get("title"), "model": llm.model_used},
+            )
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.warning(
+                "LLM returned invalid JSON on first attempt, retrying with strict prompt",
+                extra={"problem_title": metadata.get("title"), "error": str(exc)},
+            )
             strict_prompt = (
                 SYSTEM_PROMPT
                 + "\nYour previous response failed JSON validation. Return only one complete JSON object. Escape newlines in strings and do not truncate strings."
@@ -403,9 +437,22 @@ async def my_problems(count: int = Query(default=1, ge=1, le=5)):
                 payload["model_used"] = llm.model_used
                 payload["submissions_url"] = leetcode_submissions_url_from_problem_url(metadata["url"])
                 refreshers.append(ProblemRefresher.model_validate(payload))
-            except (json.JSONDecodeError, ValidationError) as exc:
-                refreshers.append(_fallback_refresher(metadata, llm, f"Invalid LLM JSON: {exc}"))
+                logger.info(
+                    "Refresher generated on retry",
+                    extra={"problem_title": metadata.get("title"), "model": llm.model_used},
+                )
+            except (json.JSONDecodeError, ValidationError) as exc2:
+                logger.error(
+                    "Refresher generation failed after retry, using fallback",
+                    extra={"problem_title": metadata.get("title"), "error": str(exc2)},
+                    exc_info=True,
+                )
+                refreshers.append(_fallback_refresher(metadata, llm, f"Invalid LLM JSON: {exc2}"))
         except HTTPException as exc:
+            logger.error(
+                "Refresher generation failed with HTTP error, using fallback",
+                extra={"problem_title": metadata.get("title"), "status_code": exc.status_code, "detail": exc.detail},
+            )
             refreshers.append(_fallback_refresher(metadata, llm, str(exc.detail)))
     return refreshers
 
@@ -423,13 +470,20 @@ async def list_problems():
 
 @router.post("/problems/sync-leetcode", response_model=LeetCodeSyncResponse)
 async def sync_leetcode_problems():
-    return await sync_leetcode_submissions_to_file()
+    logger.info("Manual LeetCode sync triggered")
+    result = await sync_leetcode_submissions_to_file()
+    logger.info(
+        "LeetCode sync completed",
+        extra={"fetched": result.fetched, "accepted": result.accepted, "added": result.added, "total": result.total},
+    )
+    return result
 
 
 @router.post("/problems/add")
 async def add_problem(body: ProblemUrl):
     normalized_url = normalize_problem_url(body.url)
     if not _is_supported_url(normalized_url):
+        logger.warning("Rejected unsupported problem URL", extra={"url": normalized_url})
         raise HTTPException(status_code=400, detail="Unsupported problem URL domain")
 
     slug = _leetcode_slug_from_url(normalized_url)
@@ -444,15 +498,19 @@ async def add_problem(body: ProblemUrl):
             await upsert_solved_problems([row])
             total = len(await list_solved_problems())
         except SupabaseError as exc:
+            logger.error("Failed to add problem to Supabase", extra={"slug": slug}, exc_info=True)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.info("Problem added to Supabase", extra={"slug": slug, "total": total})
         return {"total": total, "url": row["url"]}
 
     path = _problems_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_problem_urls()
-    if normalized_url not in existing:
+    is_new = normalized_url not in existing
+    if is_new:
         with path.open("a", encoding="utf-8") as file:
             file.write(f"\n{normalized_url}\n")
+    logger.info("Problem added to file", extra={"url": normalized_url, "was_new": is_new})
     return {"total": len(_read_problem_urls()), "url": normalized_url}
 
 
@@ -465,11 +523,14 @@ async def remove_problem(body: ProblemUrl):
             removed = await delete_solved_problem(slug)
             total = len(await list_solved_problems())
         except SupabaseError as exc:
+            logger.error("Failed to remove problem from Supabase", extra={"slug": slug}, exc_info=True)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.info("Problem removed from Supabase", extra={"slug": slug, "removed": removed, "total": total})
         return {"total": total, "removed": removed}
 
     path = _problems_path()
     if not path.exists():
+        logger.warning("Remove requested but problems file does not exist", extra={"url": normalized_url})
         return {"total": 0, "removed": False}
 
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -481,4 +542,5 @@ async def remove_problem(body: ProblemUrl):
             continue
         kept_lines.append(line)
     path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+    logger.info("Problem removed from file", extra={"url": normalized_url, "removed": removed})
     return {"total": len(_read_problem_urls()), "removed": removed}

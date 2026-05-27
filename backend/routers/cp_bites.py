@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Optional
 
@@ -9,6 +10,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from services.cp_bites_service import fetch_codeforces_article_excerpt, get_random_cp_article, load_cp_blogs
 from services.llm_service import LLMService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -75,12 +78,25 @@ async def _generate_and_validate(llm: LLMService, article: dict, excerpt: str) -
 @router.get("/cp-bites", response_model=CPBiteResponse)
 async def cp_bites(category: Optional[str] = Query(default=None)):
     article = get_random_cp_article(category)
+    logger.info(
+        "Generating CP bite",
+        extra={"article_title": article.get("title"), "category": category or article.get("category")},
+    )
     excerpt = await fetch_codeforces_article_excerpt(article["url"])
     llm = LLMService()
 
     try:
-        return await _generate_and_validate(llm, article, excerpt)
-    except (json.JSONDecodeError, ValidationError):
+        result = await _generate_and_validate(llm, article, excerpt)
+        logger.info(
+            "CP bite generated successfully",
+            extra={"article_title": article.get("title"), "model": llm.model_used, "excerpt_used": bool(excerpt)},
+        )
+        return result
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "CP bite first attempt invalid JSON, retrying",
+            extra={"article_title": article.get("title"), "error": str(exc)},
+        )
         strict_prompt = (
             SYSTEM_PROMPT
             + "\nYour previous response failed JSON validation. Return one complete JSON object only. Escape newlines in strings."
@@ -93,9 +109,19 @@ async def cp_bites(category: Optional[str] = Query(default=None)):
             payload = _extract_json(raw)
             payload["source_excerpt_used"] = bool(excerpt)
             payload["model_used"] = llm.model_used
-            return CPBiteResponse.model_validate(payload)
-        except (json.JSONDecodeError, ValidationError) as exc:
-            raise HTTPException(status_code=502, detail=f"LLM returned invalid CPBite JSON: {exc}") from exc
+            result = CPBiteResponse.model_validate(payload)
+            logger.info(
+                "CP bite generated on retry",
+                extra={"article_title": article.get("title"), "model": llm.model_used},
+            )
+            return result
+        except (json.JSONDecodeError, ValidationError) as exc2:
+            logger.error(
+                "CP bite generation failed after retry",
+                extra={"article_title": article.get("title"), "error": str(exc2)},
+                exc_info=True,
+            )
+            raise HTTPException(status_code=502, detail=f"LLM returned invalid CPBite JSON: {exc2}") from exc2
 
 
 @router.get("/cp-bites/sources")

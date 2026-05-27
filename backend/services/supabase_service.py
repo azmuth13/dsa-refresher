@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
 
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseNotConfiguredError(RuntimeError):
@@ -57,14 +60,23 @@ async def list_solved_problems() -> list[dict[str, Any]]:
         "select": "slug,title,url,submissions_url,first_accepted_at,last_submission_at,last_synced_at,lang",
         "order": "last_submission_at.desc.nullslast,created_at.desc",
     }
+    logger.debug("Supabase list_solved_problems called")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(_table_url(), headers=_headers(), params=params)
             response.raise_for_status()
-            return response.json()
+            records = response.json()
+            logger.debug("Supabase list_solved_problems succeeded", extra={"count": len(records)})
+            return records
     except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Supabase list failed with HTTP error",
+            extra={"status_code": exc.response.status_code, "response_body": exc.response.text[:500]},
+            exc_info=True,
+        )
         raise SupabaseError(f"Supabase list failed: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
+        logger.error("Supabase list failed — cannot reach Supabase", exc_info=True)
         raise SupabaseError(f"Could not reach Supabase: {exc}") from exc
 
 
@@ -85,6 +97,7 @@ async def upsert_solved_problems(rows: list[dict[str, Any]]) -> list[dict[str, A
     normalized_rows = [{column: row.get(column) for column in columns} for row in rows]
 
     params = {"on_conflict": "slug"}
+    logger.debug("Supabase upsert_solved_problems called", extra={"row_count": len(normalized_rows)})
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -94,14 +107,26 @@ async def upsert_solved_problems(rows: list[dict[str, Any]]) -> list[dict[str, A
                 json=normalized_rows,
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            logger.info(
+                "Supabase upsert succeeded",
+                extra={"upserted_count": len(normalized_rows)},
+            )
+            return result
     except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Supabase upsert failed with HTTP error",
+            extra={"status_code": exc.response.status_code, "response_body": exc.response.text[:500]},
+            exc_info=True,
+        )
         raise SupabaseError(f"Supabase upsert failed: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
+        logger.error("Supabase upsert failed — cannot reach Supabase", exc_info=True)
         raise SupabaseError(f"Could not reach Supabase: {exc}") from exc
 
 
 async def delete_solved_problem(slug: str) -> bool:
+    logger.debug("Supabase delete_solved_problem called", extra={"slug": slug})
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.delete(
@@ -110,8 +135,16 @@ async def delete_solved_problem(slug: str) -> bool:
                 params={"slug": f"eq.{slug}"},
             )
             response.raise_for_status()
-            return bool(response.json())
+            deleted = bool(response.json())
+            logger.info("Supabase delete succeeded", extra={"slug": slug, "deleted": deleted})
+            return deleted
     except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Supabase delete failed with HTTP error",
+            extra={"slug": slug, "status_code": exc.response.status_code, "response_body": exc.response.text[:500]},
+            exc_info=True,
+        )
         raise SupabaseError(f"Supabase delete failed: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
+        logger.error("Supabase delete failed — cannot reach Supabase", extra={"slug": slug}, exc_info=True)
         raise SupabaseError(f"Could not reach Supabase: {exc}") from exc

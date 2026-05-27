@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 
 from fastapi import APIRouter, HTTPException
@@ -7,6 +8,8 @@ from pydantic import BaseModel, Field, ValidationError
 from services.llm_service import LLMService
 from services.scraper_service import fetch_cppalgorithms_context
 from services.topic_service import get_random_topic
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -73,6 +76,7 @@ async def _generate_and_validate(
 @router.get("/random-topic", response_model=RandomTopicResponse)
 async def random_topic():
     topic = get_random_topic()
+    logger.info("Generating random topic bite", extra={"topic": topic.get("name"), "category": topic.get("category")})
     context = await fetch_cppalgorithms_context(topic["name"])
     source_context_used = bool(context)
 
@@ -87,13 +91,32 @@ async def random_topic():
 
     llm = LLMService()
     try:
-        return await _generate_and_validate(llm, SYSTEM_PROMPT, user_prompt, source_context_used)
-    except (json.JSONDecodeError, ValidationError):
+        result = await _generate_and_validate(llm, SYSTEM_PROMPT, user_prompt, source_context_used)
+        logger.info(
+            "Random topic bite generated successfully",
+            extra={"topic": topic.get("name"), "model": llm.model_used, "context_used": source_context_used},
+        )
+        return result
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "Random topic bite first attempt invalid JSON, retrying",
+            extra={"topic": topic.get("name"), "error": str(exc)},
+        )
         strict_prompt = (
             SYSTEM_PROMPT
             + "\nYour previous response failed JSON validation. Return only one complete JSON object with all required fields and no markdown. Escape all newlines inside template_code as \\n and do not truncate strings."
         )
         try:
-            return await _generate_and_validate(llm, strict_prompt, user_prompt, source_context_used)
-        except (json.JSONDecodeError, ValidationError) as exc:
-            raise HTTPException(status_code=502, detail=f"LLM returned invalid refresher JSON: {exc}") from exc
+            result = await _generate_and_validate(llm, strict_prompt, user_prompt, source_context_used)
+            logger.info(
+                "Random topic bite generated on retry",
+                extra={"topic": topic.get("name"), "model": llm.model_used},
+            )
+            return result
+        except (json.JSONDecodeError, ValidationError) as exc2:
+            logger.error(
+                "Random topic bite generation failed after retry",
+                extra={"topic": topic.get("name"), "error": str(exc2)},
+                exc_info=True,
+            )
+            raise HTTPException(status_code=502, detail=f"LLM returned invalid refresher JSON: {exc2}") from exc2
