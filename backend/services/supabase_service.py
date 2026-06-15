@@ -57,8 +57,11 @@ def unix_timestamp_to_iso(timestamp: str | int | None) -> Optional[str]:
 
 async def list_solved_problems() -> list[dict[str, Any]]:
     params = {
-        "select": "slug,title,url,submissions_url,first_accepted_at,last_submission_at,last_synced_at,lang",
-        "order": "last_submission_at.desc.nullslast,created_at.desc",
+        "select": (
+            "slug,title,url,submissions_url,first_accepted_at,last_submission_at,last_synced_at,lang,"
+            "created_at,is_daily_bite_pointer,daily_bite_last_shown_at"
+        ),
+        "order": "created_at.asc",
     }
     logger.debug("Supabase list_solved_problems called")
     try:
@@ -77,6 +80,61 @@ async def list_solved_problems() -> list[dict[str, Any]]:
         raise SupabaseError(f"Supabase list failed: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
         logger.error("Supabase list failed — cannot reach Supabase", exc_info=True)
+        raise SupabaseError(f"Could not reach Supabase: {exc}") from exc
+
+
+async def advance_daily_bite_pointer(shown_slug: str, next_slug: str, shown_at: str) -> None:
+    logger.debug(
+        "Supabase advance_daily_bite_pointer called",
+        extra={"shown_slug": shown_slug, "next_slug": next_slug},
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            clear_response = await client.patch(
+                _table_url(),
+                headers=_headers(),
+                params={"is_daily_bite_pointer": "eq.true"},
+                json={"is_daily_bite_pointer": False},
+            )
+            clear_response.raise_for_status()
+
+            shown_response = await client.patch(
+                _table_url(),
+                headers=_headers(),
+                params={"slug": f"eq.{shown_slug}"},
+                json={"daily_bite_last_shown_at": shown_at},
+            )
+            shown_response.raise_for_status()
+
+            mark_response = await client.patch(
+                _table_url(),
+                headers=_headers("return=representation"),
+                params={"slug": f"eq.{next_slug}"},
+                json={"is_daily_bite_pointer": True},
+            )
+            mark_response.raise_for_status()
+            logger.info(
+                "Supabase daily bite pointer advanced",
+                extra={"shown_slug": shown_slug, "next_slug": next_slug},
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Supabase daily bite pointer update failed with HTTP error",
+            extra={
+                "shown_slug": shown_slug,
+                "next_slug": next_slug,
+                "status_code": exc.response.status_code,
+                "response_body": exc.response.text[:500],
+            },
+            exc_info=True,
+        )
+        raise SupabaseError(f"Supabase daily bite pointer update failed: {exc.response.text}") from exc
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Supabase daily bite pointer update failed — cannot reach Supabase",
+            extra={"shown_slug": shown_slug, "next_slug": next_slug},
+            exc_info=True,
+        )
         raise SupabaseError(f"Could not reach Supabase: {exc}") from exc
 
 

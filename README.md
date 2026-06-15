@@ -58,6 +58,8 @@ curl -X POST http://localhost:8000/api/problems/add \
   -d '{"url":"https://leetcode.com/problems/two-sum/"}'
 ```
 
+When using Supabase, apply `backend/supabase_daily_bite_pointer.sql` once. The daily My Problem bite is selected by `created_at` order, shows the current pointer row, immediately advances the pointer to the next row, and wraps back to the oldest row after the latest row.
+
 ## Future: WhatsApp Integration
 
 The `/api/random-topic` and `/api/my-problems` endpoints are already WhatsApp-webhook-ready: they accept simple HTTP requests and return structured refresher content. To add WhatsApp delivery, create a Twilio or WhatsApp Business webhook that calls one of these endpoints, formats the JSON into a compact message, and sends it back to the user.

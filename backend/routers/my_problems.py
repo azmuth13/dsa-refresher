@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +17,7 @@ from services.llm_service import LLMService
 from services.scraper_service import SUPPORTED_DOMAINS, normalize_problem_url, parse_problem_metadata
 from services.supabase_service import (
     SupabaseError,
+    advance_daily_bite_pointer,
     delete_solved_problem,
     is_supabase_configured,
     list_solved_problems,
@@ -178,6 +178,63 @@ def _metadata_from_problem_record(record: dict[str, Any]) -> Optional[dict]:
         "url": record.get("url") or _leetcode_problem_url(slug),
         "tags": [],
     }
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _created_at_sort_key(record: dict[str, Any]) -> tuple[bool, datetime, str]:
+    created_at = _parse_datetime(record.get("created_at"))
+    return (
+        created_at is None,
+        created_at or datetime.max.replace(tzinfo=timezone.utc),
+        record.get("slug") or record.get("url", ""),
+    )
+
+
+def _ordered_problem_records(problem_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(problem_records, key=_created_at_sort_key)
+
+
+async def _select_daily_problem_record(problem_records: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered_records = _ordered_problem_records(problem_records)
+    now = datetime.now(timezone.utc)
+    current_index = next(
+        (index for index, record in enumerate(ordered_records) if record.get("is_daily_bite_pointer")),
+        None,
+    )
+
+    selected_index = current_index or 0
+    next_index = 0 if selected_index == len(ordered_records) - 1 else selected_index + 1
+    selected_record = ordered_records[selected_index]
+    next_record = ordered_records[next_index]
+    selected_slug = selected_record.get("slug") or _leetcode_slug_from_url(selected_record.get("url", ""))
+    next_slug = next_record.get("slug") or _leetcode_slug_from_url(next_record.get("url", ""))
+    if is_supabase_configured() and selected_slug and next_slug:
+        try:
+            await advance_daily_bite_pointer(selected_slug, next_slug, now.isoformat())
+        except SupabaseError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        selected_record["is_daily_bite_pointer"] = False
+        selected_record["daily_bite_last_shown_at"] = now.isoformat()
+        next_record["is_daily_bite_pointer"] = True
+
+    return selected_record
+
+
+async def _select_problem_records(problem_records: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    if count == 1:
+        return [await _select_daily_problem_record(problem_records)]
+    return _ordered_problem_records(problem_records)[: min(count, len(problem_records))]
 
 
 async def _read_problem_records() -> list[dict[str, Any]]:
@@ -405,7 +462,7 @@ async def my_problems(count: int = Query(default=1, ge=1, le=5)):
         logger.warning("No solved problems found in storage")
         raise HTTPException(status_code=404, detail="No solved problems found")
 
-    selected_records = random.sample(problem_records, k=min(count, len(problem_records)))
+    selected_records = await _select_problem_records(problem_records, count)
     logger.info("Generating problem refreshers", extra={"requested": count, "selected": len(selected_records)})
     llm = LLMService()
     refreshers: list[ProblemRefresher] = []
